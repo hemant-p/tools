@@ -1089,6 +1089,76 @@ def fixup_child_poms(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Eclipse workspace file cleanup
+# ──────────────────────────────────────────────────────────────────────────────
+
+ECLIPSE_ARTIFACTS = [".classpath", ".project", ".settings"]
+
+
+def purge_eclipse_files(project_root: Path, module_poms: List[Path]) -> None:
+    """
+    Delete Eclipse workspace files (.classpath, .project, .settings/) from
+    the project root and every module directory.  These are derived state —
+    the POM is the source of truth — and their presence can interfere with
+    IntelliJ's Maven import.
+    """
+    dirs_to_scan = [project_root] + [p.parent for p in module_poms]
+    deleted: List[str] = []
+
+    for d in dirs_to_scan:
+        for name in ECLIPSE_ARTIFACTS:
+            target = d / name
+            if target.is_file():
+                if DRY_RUN:
+                    _info(f"[DRY-RUN] Would delete {target}")
+                else:
+                    target.unlink()
+                deleted.append(str(target.relative_to(project_root)))
+            elif target.is_dir():
+                if DRY_RUN:
+                    _info(f"[DRY-RUN] Would delete {target}/")
+                else:
+                    shutil.rmtree(target)
+                deleted.append(str(target.relative_to(project_root)) + "/")
+
+    if deleted:
+        _ok(f"Deleted {len(deleted)} Eclipse artifact(s): {', '.join(deleted)}")
+    else:
+        _info("No Eclipse workspace files found — nothing to clean")
+
+    # Ensure these patterns are in the root .gitignore so they don't come back
+    _update_root_gitignore(project_root)
+
+
+def _update_root_gitignore(project_root: Path) -> None:
+    """Append Eclipse artifact patterns to the root .gitignore if missing."""
+    gi_path = project_root / ".gitignore"
+    patterns = [".classpath", ".project", ".settings/"]
+
+    existing = ""
+    if gi_path.exists():
+        existing = gi_path.read_text(encoding="utf-8")
+
+    missing = [p for p in patterns if p not in existing]
+    if not missing:
+        return
+
+    block = (
+        "\n# Eclipse workspace files (generated — do not commit)\n"
+        + "\n".join(missing)
+        + "\n"
+    )
+
+    if DRY_RUN:
+        _info(f"[DRY-RUN] Would append Eclipse patterns to {gi_path}")
+        return
+
+    with open(gi_path, "a", encoding="utf-8") as f:
+        f.write(block)
+    _ok(f"Added {', '.join(missing)} to root .gitignore")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Console helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1242,6 +1312,10 @@ def print_instructions(
     • {native_dir}/README.md ← instructions for native libs
     • build.cmd         ← Windows build script
     • build.sh          ← Unix build script
+
+  Deleted (Eclipse workspace state — POM is the source of truth)
+    • .classpath, .project, .settings/ (from root and all modules, if present)
+    • Patterns added to root .gitignore to prevent re-commit
 """)
 
     # ── Warnings ──────────────────────────────────────────────────────────
@@ -1339,7 +1413,7 @@ def main() -> None:
     print(f"  Native dir   : {args.native_dir}")
 
     # ── Step 1: Parse Eclipse launch file ─────────────────────────────────
-    print(f"\n[1/7] Parsing Eclipse launch file …")
+    print(f"\n[1/8] Parsing Eclipse launch file …")
     launch = EclipseLaunch(str(launch_path))
 
     if not launch.main_class:
@@ -1365,7 +1439,7 @@ def main() -> None:
     _ok(f"Env vars     : {len(launch.env_vars)} variable(s)")
 
     # ── Step 2: Discover modules ───────────────────────────────────────────
-    print(f"\n[2/7] Discovering Maven modules …")
+    print(f"\n[2/8] Discovering Maven modules …")
     parent = PomHandler(pom_path)
     top_level = parent.modules()
     all_poms  = collect_all_module_poms(parent)
@@ -1374,15 +1448,15 @@ def main() -> None:
     _ok(f"Total child POMs  : {len(all_poms)} (including nested)")
 
     # ── Step 3: Find launcher module ───────────────────────────────────────
-    print(f"\n[3/7] Locating launcher module …")
+    print(f"\n[3/8] Locating launcher module …")
     module_name, module_dir = find_launcher_module(parent, launch.main_class)
 
     # ── Step 4: Prompt for Maven command ──────────────────────────────────
-    print(f"\n[4/7] Maven build command …")
+    print(f"\n[4/8] Maven build command …")
     maven_command = prompt_maven_command(project_root)
 
     # ── Step 5: Modify parent POM ─────────────────────────────────────────
-    print(f"\n[5/7] Modifying parent pom.xml …")
+    print(f"\n[5/8] Modifying parent pom.xml …")
     parent.set_properties(args.source, args.target, args.encoding)
     parent.configure_compiler_plugin(args.source, args.target, args.encoding)
     parent.configure_surefire_plugin()
@@ -1393,11 +1467,15 @@ def main() -> None:
     _ok(f"Saved + backup : pom.xml.bak")
 
     # ── Step 6: Fixup child POMs ──────────────────────────────────────────
-    print(f"\n[6/7] Checking {len(all_poms)} child POM(s) for overrides …")
+    print(f"\n[6/8] Checking {len(all_poms)} child POM(s) for overrides …")
     fixup_child_poms(all_poms, args.source, args.target, args.encoding)
 
-    # ── Step 7: Generate .idea/ files ─────────────────────────────────────
-    print(f"\n[7/7] Generating .idea/ configuration …")
+    # ── Step 7: Purge Eclipse workspace files ─────────────────────────────
+    print(f"\n[7/8] Cleaning Eclipse workspace files …")
+    purge_eclipse_files(project_root, all_poms)
+
+    # ── Step 8: Generate .idea/ files ─────────────────────────────────────
+    print(f"\n[8/8] Generating .idea/ configuration …")
     ensure_native_dir(project_root, args.native_dir)
 
     gen = IdeaGenerator(
