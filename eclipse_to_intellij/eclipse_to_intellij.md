@@ -40,7 +40,7 @@ Validate that `--pom` and `--launch` exist. Exit with error if not.
 
 ## Execution Steps
 
-The script executes seven sequential steps. Print a `[N/7]` progress header before each.
+The script executes eight sequential steps. Print a `[N/8]` progress header before each.
 
 ---
 
@@ -223,11 +223,33 @@ If the child declares `maven-surefire-plugin` or `maven-failsafe-plugin`, ensure
 
 ---
 
-### Step 7 — Generate `.idea/` files
+### Step 7 — Purge Eclipse workspace files
+
+Eclipse generates `.classpath`, `.project`, and `.settings/` inside each project/module directory. These are workspace state derived from the POM. When present alongside a Maven `pom.xml`, they interfere with IntelliJ's Maven import — IntelliJ tries to reconcile both models and the result is unreliable. Since the POM is the sole source of truth for compilation, packaging, and deployment, these files are dead weight.
+
+**Scan and delete:** Walk the project root and every module directory discovered in Step 2. For each, check for `.classpath` (file), `.project` (file), and `.settings/` (directory). Delete every one found. For directories, use `shutil.rmtree`. Print the count and relative paths of everything deleted.
+
+**Update root `.gitignore`:** After deletion, read the root `.gitignore` (or treat as empty if it doesn't exist). Check whether each of `.classpath`, `.project`, `.settings/` appears in the file. For any that are missing, append them in a labeled block:
+
+```gitignore
+
+# Eclipse workspace files (generated — do not commit)
+.classpath
+.project
+.settings/
+```
+
+Only append the patterns that are actually missing. If all three are already present, do nothing.
+
+Store the target filenames as a constant: `ECLIPSE_ARTIFACTS = [".classpath", ".project", ".settings"]`.
+
+---
+
+### Step 8 — Generate `.idea/` files
 
 Create the `.idea/` and `.idea/runConfigurations/` directories. Generate these files:
 
-#### 7a. Run configuration: `.idea/runConfigurations/{SafeName}.xml`
+#### 8a. Run configuration: `.idea/runConfigurations/{SafeName}.xml`
 
 Sanitize the app name for the filename: replace any character not in `[A-Za-z0-9_-]` with `_`.
 
@@ -291,7 +313,7 @@ Where `native_path` = `$PROJECT_DIR$/{native_dir}`.
 - `PROGRAM_PARAMETERS` — always present even if empty.
 - All attribute values must be XML-escaped (`&`, `<`, `>`, `"`).
 
-#### 7b. `misc.xml` — Project SDK and language level
+#### 8b. `misc.xml` — Project SDK and language level
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -321,7 +343,7 @@ Where `native_path` = `$PROJECT_DIR$/{native_dir}`.
 
 Store this as a lookup map. If the source version isn't in the map, fall back to `JDK_{source}`.
 
-#### 7c. `compiler.xml` — Bytecode target and annotation processing
+#### 8c. `compiler.xml` — Bytecode target and annotation processing
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -350,7 +372,7 @@ Store this as a lookup map. If the source version isn't in the map, fall back to
 </project>
 ```
 
-#### 7d. `encodings.xml`
+#### 8d. `encodings.xml`
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -364,7 +386,7 @@ Store this as a lookup map. If the source version isn't in the map, fall back to
 
 Both `PROJECT` and `file://$PROJECT_DIR$` entries are required — IntelliJ checks both scopes.
 
-#### 7e. `.gitignore`
+#### 8e. `.gitignore`
 
 ```gitignore
 # ── IntelliJ default excludes ──
@@ -391,7 +413,7 @@ Both `PROJECT` and `file://$PROJECT_DIR$` entries are required — IntelliJ chec
 !.gitignore
 ```
 
-#### 7f. `vcs.xml` — only if `.git/` exists at project root
+#### 8f. `vcs.xml` — only if `.git/` exists at project root
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -402,7 +424,7 @@ Both `PROJECT` and `file://$PROJECT_DIR$` entries are required — IntelliJ chec
 </project>
 ```
 
-#### 7g. `maven.xml` — Maven import and runner settings
+#### 8g. `maven.xml` — Maven import and runner settings
 
 Extract `-P profile1,profile2` from the Maven command (if present). Split on commas.
 
@@ -431,7 +453,7 @@ Extract `-P profile1,profile2` from the Maven command (if present). Split on com
 </project>
 ```
 
-#### 7h. Native directory and README
+#### 8h. Native directory and README
 
 Create `{project_root}/{native_dir}/` if it doesn't exist. Write a `README.md` inside it (only if the README doesn't already exist) that documents: what to place here, both JVM flags (`-Djava.library.path` and `-Djna.library.path`), why both are needed (JNA has an independent lookup), and the bitness requirement.
 
@@ -444,17 +466,17 @@ When `--dry-run` is set, the script must:
 - **Never** write, create, modify, or delete any file or directory.
 - **Never** create backups.
 - **Never** `chmod`.
-- Print `[DRY-RUN] Would write {path}`, `[DRY-RUN] Would create directory {path}`, or `[DRY-RUN] Would back up {file}` for every operation that would have occurred.
+- Print `[DRY-RUN] Would write {path}`, `[DRY-RUN] Would create directory {path}`, `[DRY-RUN] Would back up {file}`, `[DRY-RUN] Would delete {path}`, or `[DRY-RUN] Would append Eclipse patterns to {path}` for every operation that would have occurred.
 - Still perform all in-memory XML parsing and modification (to detect and report child POM overrides, etc).
 - Still prompt the user for the Maven command (the prompt is informational, not a side effect).
 
-Implement this with a global `DRY_RUN` boolean and guarded wrapper functions for every I/O operation: write-text, write-XML-bytes, mkdir, backup, chmod.
+Implement this with a global `DRY_RUN` boolean and guarded wrapper functions for every I/O operation: write-text, write-XML-bytes, mkdir, backup, chmod, delete, and gitignore-append.
 
 ---
 
 ## Post-Execution Output
 
-After all seven steps, print three sections:
+After all eight steps, print three sections:
 
 ### Section 1: "SETUP COMPLETE" — 8 numbered steps
 
@@ -469,7 +491,7 @@ After all seven steps, print three sections:
 
 ### Section 2: "WHAT WAS MODIFIED / CREATED"
 
-List every file touched, grouped by: parent POM changes, child POM changes, `.idea/` files, project root files.
+List every file touched, grouped by: parent POM changes, child POM changes, `.idea/` files, project root files, and a "Deleted" group noting that `.classpath`, `.project`, `.settings/` were removed from the root and all modules, with patterns added to root `.gitignore` to prevent re-commit.
 
 ### Section 3: "THINGS TO DOUBLE-CHECK" — 8 titled warnings
 
@@ -526,6 +548,20 @@ List every file touched, grouped by: parent POM changes, child POM changes, `.id
 ### Standalone function: `fixup_child_poms(module_poms, source, target, encoding)`
 
 Loop each child POM. Check `<properties>`, compiler plugin `<configuration>`, surefire/failsafe. Track `changed` boolean. Save once per POM if changed. Print informational warnings for custom `<outputDirectory>` and JPMS `module-info.java`.
+
+### Standalone function: `purge_eclipse_files(project_root, module_poms)`
+
+Scan project root and every module directory for `.classpath`, `.project`, `.settings/`. Delete files with `Path.unlink()`, directories with `shutil.rmtree()`. Collect relative paths of everything deleted and print a summary. Then call `_update_root_gitignore()`.
+
+### Standalone function: `_update_root_gitignore(project_root)`
+
+Read the root `.gitignore` (or empty string if absent). Check which of `.classpath`, `.project`, `.settings/` are missing. Append a labeled block with only the missing patterns. Do nothing if all three are already present.
+
+### Constant: `ECLIPSE_ARTIFACTS`
+
+```python
+ECLIPSE_ARTIFACTS = [".classpath", ".project", ".settings"]
+```
 
 ### Console helpers
 
@@ -608,11 +644,22 @@ Create a minimal project at `/tmp/test-project/`:
 test-project/
 ├── pom.xml                          (parent with <modules>: module-a, module-launcher)
 ├── .git/                            (empty dir — triggers vcs.xml generation)
+├── .gitignore                       (pre-existing, e.g. "target/\n*.class")
+├── .classpath                       (Eclipse workspace file — should be deleted)
+├── .project                         (Eclipse workspace file — should be deleted)
+├── .settings/                       (Eclipse workspace dir — should be deleted)
+│   └── org.eclipse.jdt.core.prefs
 ├── module-a/
 │   ├── pom.xml                      (<properties> with maven.compiler.source=11, target=11)
+│   ├── .classpath                   (Eclipse workspace file — should be deleted)
+│   ├── .project                     (Eclipse workspace file — should be deleted)
+│   ├── .settings/                   (Eclipse workspace dir — should be deleted)
+│   │   └── org.eclipse.jdt.core.prefs
 │   └── src/main/java/com/example/   (empty)
 ├── module-launcher/
 │   ├── pom.xml                      (no overrides)
+│   ├── .classpath                   (Eclipse workspace file — should be deleted)
+│   ├── .project                     (Eclipse workspace file — should be deleted)
 │   └── src/main/java/com/example/launcher/MainClass.java
 └── MyApp.launch                     (workspace_loc with sub-path in VM args)
 ```
@@ -621,6 +668,7 @@ Expected outcomes:
 1. Step 3 auto-detects `module-launcher` as the launcher.
 2. Step 5 injects all properties and plugins into parent POM.
 3. Step 6 detects `module-a`'s `<properties>` override (`11` → `{source}`) and corrects it.
-4. Step 7 generates all `.idea/` files. The run config's `VM_PARAMETERS` has the sub-path preserved in any translated `workspace_loc` variables. Both `-Djava.library.path` and `-Djna.library.path` point to `$PROJECT_DIR$/native`.
-5. `.idea/.gitignore` whitelists `!vcs.xml` and `!maven.xml`.
-6. With `--dry-run`, zero files are created or modified.
+4. Step 7 deletes all `.classpath`, `.project`, and `.settings/` files/directories from the root and both modules (8 artifacts total). Appends `.classpath`, `.project`, `.settings/` to the root `.gitignore`.
+5. Step 8 generates all `.idea/` files. The run config's `VM_PARAMETERS` has the sub-path preserved in any translated `workspace_loc` variables. Both `-Djava.library.path` and `-Djna.library.path` point to `$PROJECT_DIR$/native`.
+6. `.idea/.gitignore` whitelists `!vcs.xml` and `!maven.xml`.
+7. With `--dry-run`: zero files are created, modified, or deleted. `[DRY-RUN] Would delete` messages appear for each Eclipse artifact. All Eclipse files remain on disk afterward.
