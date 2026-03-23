@@ -19,7 +19,6 @@ Optional
 --------
     --app-name   "My Application"   # override the run-config display name
     --native-dir native             # directory for DLLs/SOs (default: native)
-    --deploy-dir target/deploy      # where Maven deposits native libs after build
     --encoding   UTF-8              # source file encoding (default: UTF-8)
     --dry-run                       # preview all changes without writing files
 
@@ -134,10 +133,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target",     required=True,  help="Maven compiler target (e.g. 11, 17)")
     p.add_argument("--app-name",   default=None,   help="Run-config display name (default: launch file stem)")
     p.add_argument("--native-dir", default="native", help="Dir for DLLs/SOs relative to project root")
-    p.add_argument("--deploy-dir", default=None,
-                   help="Dir where Maven deposits native libs after build "
-                        "(e.g. target/deploy). If set, build scripts will "
-                        "copy *.dll/*.so/*.dylib from here into native-dir.")
     p.add_argument("--encoding",   default="UTF-8",  help="Source file encoding (default: UTF-8)")
     p.add_argument("--dry-run",    action="store_true",
                    help="Preview all changes without writing any files")
@@ -275,57 +270,10 @@ class PomHandler:
         return (el.text or "").strip() if el is not None else ""
 
     def modules(self) -> List[str]:
-        """
-        Collect all <module> entries from both the top-level <modules> block
-        AND from any <profiles><profile><modules> blocks.  Maven allows
-        modules to be declared inside profiles, and many real-world projects
-        use this pattern (e.g. modules only built under a 'release' profile).
-        Returns a deduplicated list preserving first-seen order.
-        """
-        result: List[str] = []
-        seen: set = set()
-
-        def _collect(parent: ET.Element) -> None:
-            mods_el = self._find(parent, "modules")
-            if mods_el is not None:
-                for el in self._findall(mods_el, "module"):
-                    mod = (el.text or "").strip()
-                    if mod and mod not in seen:
-                        result.append(mod)
-                        seen.add(mod)
-
-        # Top-level <modules>
-        _collect(self._root)
-
-        # <profiles><profile> → each may have its own <modules>
-        profiles_el = self._find(self._root, "profiles")
-        if profiles_el is not None:
-            for profile_el in self._findall(profiles_el, "profile"):
-                _collect(profile_el)
-
-        return result
-
-    def profile_module_counts(self) -> List[Tuple[str, int]]:
-        """
-        Return [(profile_id, module_count), ...] for profiles that declare
-        <modules>.  Used for reporting only — does not affect module discovery.
-        """
-        result: List[Tuple[str, int]] = []
-        profiles_el = self._find(self._root, "profiles")
-        if profiles_el is None:
-            return result
-        for profile_el in self._findall(profiles_el, "profile"):
-            id_el = self._find(profile_el, "id")
-            pid = (id_el.text or "").strip() if id_el is not None else "(unnamed)"
-            mods_el = self._find(profile_el, "modules")
-            if mods_el is not None:
-                count = len([
-                    el for el in self._findall(mods_el, "module")
-                    if (el.text or "").strip()
-                ])
-                if count:
-                    result.append((pid, count))
-        return result
+        mods_el = self._find(self._root, "modules")
+        if mods_el is None:
+            return []
+        return [(el.text or "").strip() for el in self._findall(mods_el, "module")]
 
     # ── plugin helpers ─────────────────────────────────────────────────────
 
@@ -522,33 +470,62 @@ def collect_all_module_poms(handler: PomHandler) -> List[Path]:
     return result
 
 
+def _source_roots_for_module(pom_path: Path) -> List[Path]:
+    """
+    Return the list of Java source roots to search for a given module POM.
+    Checks <build><sourceDirectory> first; always appends the Maven default
+    src/main/java as a fallback.
+    """
+    module_dir = pom_path.parent
+    roots: List[Path] = []
+    try:
+        h = PomHandler(pom_path)
+        build = h._find(h._root, "build")
+        if build is not None:
+            src_dir_el = h._find(build, "sourceDirectory")
+            if src_dir_el is not None and src_dir_el.text:
+                custom = src_dir_el.text.strip()
+                # May be absolute or relative to module dir
+                p = Path(custom)
+                roots.append(p if p.is_absolute() else module_dir / p)
+    except Exception:
+        pass
+    default = module_dir / "src" / "main" / "java"
+    if default not in roots:
+        roots.append(default)
+    return roots
+
+
 def find_launcher_module(
     handler: PomHandler, main_class: str
 ) -> Tuple[str, Path]:
     """
     Try to find the Maven module that contains the main class by looking for
-    the corresponding .java source file.  Falls back to prompting the user.
+    the corresponding .java source file.  Respects custom <sourceDirectory>
+    declarations in each module POM.  Falls back to prompting the user.
     """
     project_root  = handler.project_root
     all_poms      = collect_all_module_poms(handler)
     main_rel_path = main_class.replace(".", "/") + ".java"
 
     for pom_path in all_poms:
-        src_main = pom_path.parent / "src" / "main" / "java"
-        if (src_main / main_rel_path).exists():
-            try:
-                art_id = PomHandler(pom_path).artifact_id()
-                if art_id:
-                    print(f"  ✅ Main class found in module: {art_id}")
-                    return art_id, pom_path.parent
-            except Exception:
-                pass
-            return pom_path.parent.name, pom_path.parent
+        for src_root in _source_roots_for_module(pom_path):
+            if (src_root / main_rel_path).exists():
+                try:
+                    art_id = PomHandler(pom_path).artifact_id()
+                    if art_id:
+                        print(f"  ✅ Main class found in module: {art_id}")
+                        return art_id, pom_path.parent
+                except Exception:
+                    pass
+                return pom_path.parent.name, pom_path.parent
 
     # Auto-detect failed — ask the user
     print(f"\n  ⚠️  Could not auto-detect module for: {main_class}")
     print("     Known modules:")
-    all_rels = handler.modules()
+    # Show ALL discovered module poms, not just top-level, so the user can
+    # pick a nested submodule if needed.
+    all_rels = [str(p.parent.relative_to(project_root)) for p in all_poms]
     for i, m in enumerate(all_rels):
         print(f"       [{i}] {m}")
 
@@ -846,6 +823,7 @@ class IdeaGenerator:
 
             # ── Commit these so configs travel with the repository ─────────────
             !runConfigurations/
+            !modules.xml
             !misc.xml
             !compiler.xml
             !encodings.xml
@@ -875,6 +853,61 @@ class IdeaGenerator:
         out = self.idea / "vcs.xml"
         _guarded_write_text(out, xml)
         _ok(f"vcs.xml                 : {out}")
+        return out
+
+    # ── modules.xml ───────────────────────────────────────────────────────
+
+    def modules_xml(self, all_module_poms: List[Path]) -> Path:
+        """
+        Write .idea/modules.xml so IntelliJ discovers every submodule
+        immediately on project open — before the first Maven sync runs.
+        Without this file IntelliJ only shows the root aggregator POM in
+        the Maven tool window.
+        """
+        def _iml_entry(dir_path: Path) -> str:
+            rel = dir_path.relative_to(self.project_root)
+            iml_name = dir_path.name + ".iml"
+            # Use forward slashes regardless of OS
+            rel_fwd = str(rel).replace("\\", "/")
+            return (
+                f'      <module'
+                f' fileurl="file://$PROJECT_DIR$/{rel_fwd}/{iml_name}"'
+                f' filepath="$PROJECT_DIR$/{rel_fwd}/{iml_name}" />'
+            )
+
+        lines: List[str] = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<project version="4">',
+            '  <component name="ProjectModuleManager">',
+            '    <modules>',
+        ]
+
+        # Root aggregator module entry
+        root_name = self.project_root.name
+        lines.append(
+            f'      <module'
+            f' fileurl="file://$PROJECT_DIR$/{root_name}.iml"'
+            f' filepath="$PROJECT_DIR$/{root_name}.iml" />'
+        )
+
+        # One entry per discovered child module
+        seen: set = {self.project_root}
+        for pom_path in all_module_poms:
+            mod_dir = pom_path.parent
+            if mod_dir not in seen:
+                seen.add(mod_dir)
+                lines.append(_iml_entry(mod_dir))
+
+        lines += [
+            "    </modules>",
+            "  </component>",
+            "</project>",
+            "",
+        ]
+
+        out = self.idea / "modules.xml"
+        _guarded_write_text(out, "\n".join(lines))
+        _ok(f"modules.xml             : {out}")
         return out
 
     # ── maven delegate settings ───────────────────────────────────────────
@@ -966,18 +999,11 @@ def ensure_native_dir(project_root: Path, native_dir: str) -> Path:
 # Maven build command prompt
 # ──────────────────────────────────────────────────────────────────────────────
 
-def prompt_maven_command(
-    project_root: Path,
-    native_dir: str,
-    deploy_dir: Optional[str],
-) -> str:
+def prompt_maven_command(project_root: Path) -> str:
     """
     Ask the user for the full Maven command they use to build the project.
     This captures any -P profiles, -D properties, or other flags that live
     outside the pom.xml.  Saves both a .cmd (Windows) and .sh (Unix) script.
-
-    If deploy_dir is set, the scripts also copy *.dll/*.so/*.dylib from the
-    deployment directory into the native directory after the Maven build.
     """
     # ── Detect Maven Wrapper ──────────────────────────────────────────────
     has_mvnw = (project_root / "mvnw").exists() or (project_root / "mvnw.cmd").exists()
@@ -994,7 +1020,7 @@ def prompt_maven_command(
     print("  or environment variables to build successfully.")
     print()
     print("  Enter the FULL Maven command you normally use.  Examples:")
-    print(f"    {default_mvn} clean install -P build-msi-local,Release")
+    print(f"    {default_mvn} clean package -P prod,messaging -Denv=uat -DskipTests")
     print(f"    {default_mvn} clean package -DskipTests")
     print()
     print("  Press ENTER to accept the default:")
@@ -1007,31 +1033,6 @@ def prompt_maven_command(
     # Guarantee -DskipTests is present
     if "skipTests" not in cmd and "maven.test.skip" not in cmd:
         cmd += " -DskipTests"
-
-    # ── Build the native-copy block if deploy_dir is configured ───────────
-    sh_copy_block = ""
-    cmd_copy_block = ""
-    if deploy_dir:
-        sh_copy_block = dedent(f"""\
-
-            # ── Stage native libraries from deployment directory ──────────────
-            echo "Copying native libraries from {deploy_dir}/ to {native_dir}/ ..."
-            mkdir -p "{native_dir}"
-            find "{deploy_dir}" -type f \\( -iname "*.dll" -o -iname "*.so" -o -iname "*.dylib" \\) \\
-                -exec cp -v {{}} "{native_dir}/" \\;
-            echo "Native libraries staged."
-        """)
-        cmd_copy_block = dedent(f"""\
-
-            REM ── Stage native libraries from deployment directory ─────────────
-            echo Copying native libraries from {deploy_dir}\\ to {native_dir}\\ ...
-            if not exist "{native_dir}" mkdir "{native_dir}"
-            for /R "{deploy_dir}" %%F in (*.dll *.so *.dylib) do (
-                echo   %%F
-                copy /Y "%%F" "{native_dir}\\" >nul
-            )
-            echo Native libraries staged.
-        """)
 
     # ── Windows batch script ───────────────────────────────────────────────
     # On Windows, ./mvnw → mvnw.cmd
@@ -1047,7 +1048,7 @@ def prompt_maven_command(
             REM ─────────────────────────────────────────────────────────────────
             cd /d "%~dp0"
             {win_cmd}
-        """) + cmd_copy_block,
+        """),
     )
 
     # ── Unix shell script ──────────────────────────────────────────────────
@@ -1063,7 +1064,7 @@ def prompt_maven_command(
             set -e
             cd "$(dirname "$0")"
             {cmd}
-        """) + sh_copy_block,
+        """),
     )
     if not DRY_RUN:
         try:
@@ -1261,7 +1262,6 @@ def print_instructions(
     app_name:     str,
     jdk_version:  str,
     native_dir:   str,
-    deploy_dir:   Optional[str],
     source:       str,
     target:       str,
     launch:       EclipseLaunch,
@@ -1278,28 +1278,25 @@ def print_instructions(
     print("  SETUP COMPLETE")
     print(DIVIDER)
 
-    if deploy_dir:
-        copy_note = (
-            f"build.sh / build.cmd will run Maven and then automatically copy\n"
-            f"    •   native libraries from {deploy_dir}/ into {native_dir}/."
-        )
-    else:
-        copy_note = (
-            f"You must manually place all native libraries in {native_dir}/\n"
-            f"    •   before running the app.  Re-run with --deploy-dir to automate this."
-        )
-
     steps = [
         (
-            "Run the build script ONCE before opening IntelliJ",
+            "Copy DLLs / native libraries into the native directory",
+            [
+                f"Destination: {project_root / native_dir}",
+                "Include ALL .dll (Windows) / .so (Linux) / .dylib (macOS) files.",
+                "The run config sets both -Djava.library.path and -Djna.library.path.",
+                "Both must point here — omitting either causes silent JNA failures.",
+                "DLL bitness MUST match JVM bitness (64-bit JVM → 64-bit DLLs).",
+            ],
+        ),
+        (
+            "Run the Maven build ONCE before opening IntelliJ",
             [
                 f"Terminal → cd {project_root}",
                 "Windows : build.cmd",
                 "Linux / macOS : ./build.sh",
-                "This downloads all dependencies, compiles all modules,",
-                "  copies all runtime JARs to each module's lib/,",
-                f"  and stages native libraries for IntelliJ.",
-                copy_note,
+                "This downloads all dependencies, compiles all modules (no tests,",
+                "  no javadoc), and copies all runtime JARs to each module's lib/.",
                 "⚠️  Do NOT skip — IntelliJ needs compiled output to resolve symbols.",
             ],
         ),
@@ -1320,7 +1317,12 @@ def print_instructions(
                 f"Select: {project_root / 'pom.xml'}",
                 "Choose 'Open as Project'.",
                 "When prompted 'Trust project?' → Trust.",
-                "When Maven import dialog appears → confirm import of all modules.",
+                "When the Maven import dialog appears → confirm import of ALL modules.",
+                "⚠️  If IntelliJ does NOT show a Maven import dialog automatically:",
+                "     View → Tool Windows → Maven → click 'Reload All Maven Projects' ↻",
+                "     Maven sync is what creates .iml files and marks source roots.",
+                "     Without it, src/main/java will NOT be recognised as Sources Root",
+                "     and you will see red imports everywhere.",
             ],
         ),
         (
@@ -1334,12 +1336,27 @@ def print_instructions(
             ],
         ),
         (
-            "Wait for indexing and Maven sync to finish",
+            "Verify source roots after Maven sync completes",
             [
-                "Watch the bottom status bar — it shows sync / indexing progress.",
-                "All modules will appear in the Project panel on the left.",
-                "Symbol resolution errors should disappear once sync completes.",
+                "In the Project panel, every module's src/main/java should appear",
+                "  with a BLUE folder icon — that means it is marked as Sources Root.",
+                "If any folder still shows a plain (non-blue) icon:",
+                "  Right-click the folder → Mark Directory as → Sources Root.",
+                "Alternatively: File → Project Structure → Modules → select the",
+                "  module → Sources tab → mark src/main/java as Sources.",
+                "⚠️  Plain/red folder icons after sync mean Maven sync did not finish",
+                "     successfully. Check View → Tool Windows → Maven → sync log.",
+                "     Common causes: missing profiles, unresolvable dependencies,",
+                "     or a child POM referencing a parent version not yet in .m2/.",
+            ],
+        ),
+        (
+            "Wait for background indexing to finish",
+            [
+                "Watch the bottom status bar — it shows indexing progress.",
+                "Symbol resolution errors disappear once indexing completes.",
                 "This may take several minutes on first load.",
+                "Do NOT attempt to run the app until the status bar is clear.",
             ],
         ),
         (
@@ -1388,6 +1405,7 @@ def print_instructions(
 
   .idea/ files (created or overwritten)
     • runConfigurations/{safe_config}.xml  ← the run config
+    • modules.xml       ← full submodule list (all modules visible on first open)
     • misc.xml          ← JDK {jdk_version}, language level
     • compiler.xml      ← bytecode target {target}, annotation processors
     • encodings.xml     ← UTF-8 project-wide
@@ -1499,10 +1517,6 @@ def main() -> None:
     print(f"  Source       : {args.source}   Target: {args.target}")
     print(f"  Encoding     : {args.encoding}")
     print(f"  Native dir   : {args.native_dir}")
-    if args.deploy_dir:
-        print(f"  Deploy dir   : {args.deploy_dir}")
-    else:
-        print(f"  Deploy dir   : (not set — DLLs must be placed in {args.native_dir}/ manually)")
 
     # ── Step 1: Parse Eclipse launch file ─────────────────────────────────
     print(f"\n[1/8] Parsing Eclipse launch file …")
@@ -1536,11 +1550,6 @@ def main() -> None:
     top_level = parent.modules()
     all_poms  = collect_all_module_poms(parent)
 
-    # Report where modules were found
-    profile_counts = parent.profile_module_counts()
-    for pid, cnt in profile_counts:
-        _info(f"Found {cnt} module(s) inside profile '{pid}'")
-
     _ok(f"Top-level modules : {len(top_level)} → {', '.join(top_level)}")
     _ok(f"Total child POMs  : {len(all_poms)} (including nested)")
 
@@ -1550,7 +1559,7 @@ def main() -> None:
 
     # ── Step 4: Prompt for Maven command ──────────────────────────────────
     print(f"\n[4/8] Maven build command …")
-    maven_command = prompt_maven_command(project_root, args.native_dir, args.deploy_dir)
+    maven_command = prompt_maven_command(project_root)
 
     # ── Step 5: Modify parent POM ─────────────────────────────────────────
     print(f"\n[5/8] Modifying parent pom.xml …")
@@ -1592,6 +1601,7 @@ def main() -> None:
     gen.gitignore()
     gen.vcs_xml()
     gen.maven_settings_xml(maven_command)
+    gen.modules_xml(all_poms)
     gen.run_config(module_name)
 
     # ── Print human-readable instructions ─────────────────────────────────
@@ -1600,7 +1610,6 @@ def main() -> None:
         app_name=app_name,
         jdk_version=args.jdk,
         native_dir=args.native_dir,
-        deploy_dir=args.deploy_dir,
         source=args.source,
         target=args.target,
         launch=launch,
